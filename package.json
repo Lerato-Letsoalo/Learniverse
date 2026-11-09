@@ -1,0 +1,20 @@
+{
+  "name": "learniverse",
+  "version": "2.0.0",
+  "description": "Neuroadaptive CAPS-aligned learning platform for Grades 1-7",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node --env-file=.env server/index.js",
+    "dev": "node --env-file=.env --watch server/index.js",
+    "test": "node server/ai.test.js && node server/smoke.test.js && node server/teacher.test.js && node server/migrate.test.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "express": "^4.21.2",
+    "groq-sdk": "^1.6.0",
+    "nodemailer": "^10.3.1"
+  }
+}

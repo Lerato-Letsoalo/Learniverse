@@ -1,0 +1,77 @@
+process.env.DB_PATH = ':memory:'; process.env.ADMIN_EMAIL = 'admin@test.co.za'; process.env.ADMIN_PASSWORD = 'adminpass123';
+const { app, outbox } = await import('./index.js'); const { db } = await import('./db.js');
+const srv = app.listen(0); const base = `http://localhost:${srv.address().port}/api`;
+const mk = () => { let ck = ''; return async (m, u, b) => { const r = await fetch(base + u, { method: m, headers: { 'Content-Type': 'application/json', cookie: ck }, body: m === 'GET' ? undefined : JSON.stringify(b || {}) }); const s = r.headers.get('set-cookie'); if (s) ck = s.split(';')[0]; return { s: r.status, d: await r.json() }; }; };
+let fail = 0; const ok = (c, msg) => { console.log((c ? 'PASS ' : 'FAIL ') + msg); if (!c) fail++; };
+const right = q => q.type === 'mcq' ? q.answer : q.type === 'num' ? String(q.answer) : q.answer; // correct answers straight from the stored session
+const answers = id => JSON.parse(db.prepare('SELECT qs FROM quiz_sessions WHERE id=?').get(id).qs).map(right);
+const L = mk(), P = mk(), A = mk(), X = mk();
+let r = await L('POST', '/auth/register', { name: 'Thabo Mokoena', email: 't@x.co.za', password: 'password1', role: 'learner', consent: true }); ok(r.s === 201, 'learner registers'); const code = r.d.code;
+ok((await X('POST', '/auth/register', { name: 'No Consent', email: 'n@x.co.za', password: 'password1', role: 'learner' })).s === 400, 'consent required');
+ok((await L('PUT', '/me/profile', { grade: 4, interests: ['Football', 'Space', 'Bad'], prefs: { dyslexia: true } })).d.interests.length === 2, 'onboarding saves');
+r = await L('GET', '/dashboard'); const names = r.d.subjects.map(s => s.name);
+ok(['Home Language', 'First Additional Language', 'Mathematics', 'Natural Sciences and Technology', 'Social Sciences', 'Life Skills'].every(n => names.includes(n)) && names.length === 6, 'Grade 4 has the 6 Intermediate Phase subjects');
+await L('PUT', '/me/profile', { grade: 7 }); names.length = 0; (await L('GET', '/dashboard')).d.subjects.forEach(s => names.push(s.name));
+ok(names.length === 9 && names.includes('Economic and Management Sciences') && names.includes('Life Orientation') && names.includes('Technology'), 'Grade 7 has the 9 Senior Phase subjects');
+await L('PUT', '/me/profile', { grade: 2 }); ok((await L('GET', '/dashboard')).d.subjects.length === 4, 'Grade 2 has the 4 Foundation subjects');
+await L('PUT', '/me/profile', { grade: 4 });
+const maths = (await L('GET', '/dashboard')).d.subjects.find(s => s.slug === 'maths'); r = await L('GET', '/subjects/' + maths.id);
+const ls = r.d.modules.flatMap(m => m.lessons); ok(r.d.modules.length === 3 && ls.length === 6 && ls[0].status === 'current' && ls[1].status === 'locked' && ls[2].lock === 'Complete Module 1', 'modules, sequential locking, lock labels');
+ok((await L('GET', '/lessons/' + ls[1].id)).s === 403, 'locked lesson cannot be opened');
+ok((await L('POST', '/quiz', { lessonId: ls[1].id })).s === 403, 'locked lesson quiz blocked');
+r = await L('GET', '/lessons/' + ls[0].id); ok(r.d.notes.mnemonic && /football|star/i.test(r.d.notes.example + r.d.notes.interest) && !/\{/.test(r.d.notes.example), 'notes use mnemonic + interest-themed example');
+r = await L('POST', '/quiz', { lessonId: ls[0].id }); ok(r.d.questions.length === 5 && r.d.questions.every(q => q.hints.length === 2) && !JSON.stringify(r.d).includes('"answer"'), 'quiz has 5 questions with hints, no answers leaked');
+const types = new Set(r.d.questions.map(q => q.type)); ok(types.has('order') && types.has('num') && types.has('mcq'), 'maths quiz mixes multiple choice, typed answer and drag-to-order');
+let sub = await L('POST', `/quiz/${r.d.id}/submit`, { answers: answers(r.d.id) }); ok(sub.d.pct === 100 && sub.d.passed && sub.d.unlockedNext, 'perfect score passes, unlocks next lesson, corrections returned');
+ok(sub.d.results.every(x => x.explain && x.shown), 'every question has a worked correction');
+ok((await L('GET', '/lessons/' + ls[1].id)).s === 200, 'next lesson now open');
+ok((await L('POST', `/quiz/${r.d.id}/submit`, { answers: [] })).s === 409, 'quiz cannot be resubmitted');
+// english-type (static) lesson: all activity types
+await L('PUT', '/me/profile', { grade: 4 }); const hl = (await L('GET', '/dashboard')).d.subjects.find(s => s.slug === 'hl'); const hl1 = (await L('GET', '/subjects/' + hl.id)).d.modules[0].lessons[0];
+r = await L('POST', '/quiz', { lessonId: hl1.id }); ok(new Set(r.d.questions.map(q => q.type)).size === 3 && r.d.questions.some(q => q.type === 'match') && r.d.questions.some(q => q.type === 'blank'), 'language quiz mixes choice, fill-in and drag-and-drop');
+sub = await L('POST', `/quiz/${r.d.id}/submit`, { answers: [9, 'zzz', 9, ['a', 'b', 'c'], 9] }); ok(sub.d.pct === 0 && !sub.d.passed && sub.d.advice.includes('try again'), 'failed quiz: encouraged to retry, lesson stays unfinished');
+ok((await L('GET', '/subjects/' + hl.id)).d.modules[0].lessons[1].status === 'locked', 'failed quiz does not unlock next lesson');
+r = await L('GET', '/report'); const hr = r.d.rows.find(x => x.slug === 'hl'), mr = r.d.rows.find(x => x.slug === 'maths');
+ok(mr.mark === 100 && mr.code === 7 && mr.descriptor === 'Outstanding' && mr.required === 3 && mr.status === 'met', 'report: Maths 100% = Level 7 Outstanding, requirement Level 3 met');
+ok(hr.mark === 0 && hr.code === 1 && hr.required === 4 && hr.status === 'not_met' && r.d.verdict === 'at_risk' && r.d.notes.length === 1, 'report: Home Language needs Level 4, flagged at risk');
+ok(r.d.rows.find(x => x.slug === 'life').required === 2 && r.d.scale.length === 7, 'other subjects need Level 2; 7-level scale present');
+r = await L('GET', '/plan'); ok(r.d.subjects[0].name === 'Mathematics' && r.d.hours === 2 && !r.d.saved, 'default study plan prioritises Maths');
+r = await P('POST', '/auth/register', { name: 'Mrs Mokoena', email: 'p@x.co.za', password: 'password1', role: 'parent', consent: true });
+const kid = (await L('GET', '/me')).d.id; ok((await P('PUT', '/parent/plan/' + kid, { subjects: [{ name: 'Mathematics', priority: 1 }], hours: 2 })).s === 403, 'unlinked parent cannot set plan');
+ok((await P('POST', '/parent/link', { code })).s === 200, 'parent links child');
+r = await P('PUT', '/parent/plan/' + kid, { subjects: [{ name: 'Mathematics', priority: 1 }, { name: 'English', priority: 2 }], exam: '2026-12-01', hours: 3, view: 'monthly' }); ok(r.s === 200 && r.d.saved && r.d.view === 'monthly', 'parent saves study plan');
+ok((await L('GET', '/plan')).d.hours === 3, 'learner sees the parent plan');
+r = await P('GET', '/parent/children'); ok(r.d[0].report.rows.length === 6 && r.d[0].plan.exam === '2026-12-01' && r.d[0].lessons.length >= 1, 'parent sees report card, plan and progress');
+
+// ---- interest-themed content: football learner ----
+await L('PUT', '/me/profile', { interests: ['Football'] });
+r = await L('POST', '/quiz', { lessonId: hl1.id }); const hlJson = JSON.stringify(r.d.questions); ok(hlJson.includes('in football') && /Vocabulary Builder/.test(r.d.title), 'language quiz is a football Vocabulary Builder');
+r = await L('GET', '/subjects/' + maths.id); const m2 = r.d.modules.flatMap(m => m.lessons).find(x => x.status === 'current' || x.status === 'progress'); r = await L('POST', '/quiz', { lessonId: m2.id });
+ok(/goals|match/i.test(JSON.stringify(r.d.questions)) && /Mastery/.test(r.d.title), 'maths quiz uses football goals and matches, named "... Mastery"');
+const a1 = JSON.stringify((await L('POST', '/quiz', { lessonId: m2.id })).d.questions), a2 = JSON.stringify((await L('POST', '/quiz', { lessonId: m2.id })).d.questions); ok(a1 !== a2, 'questions change every time');
+await L('PUT', '/me/profile', { grade: 1 }); const g1 = (await L('GET', '/dashboard')).d.subjects.find(x => x.slug === 'maths'); const g1l = (await L('GET', '/subjects/' + g1.id)).d.modules[0].lessons[0];
+const q1 = JSON.stringify((await L('POST', '/quiz', { lessonId: g1l.id })).d.questions); ok(q1.length > 100 && !/\b\d{4,}\b/.test(q1.replace(/\d{4}-/g, '')), 'Grade 1 maths uses small numbers'); await L('PUT', '/me/profile', { grade: 4 });
+// ---- buddies ----
+r = await L('GET', '/buddies'); ok(r.d.length === 8 && r.d[0].name === 'Finn the Fox' && r.d[7].name === 'Luna the Unicorn' && r.d.every(b => b.intro && b.personality), '8 buddies with personality and intro');
+await L('PUT', '/me/profile', { buddy: 'nope' }); ok((await L('GET', '/me')).d.buddy == null, 'invalid buddy ignored');
+ok((await L('PUT', '/me/profile', { buddy: 'leo' })).d.buddy === 'leo', 'buddy saved'); ok((await L('GET', '/leaderboard')).d.rows[0].buddy === 'leo', 'leaderboard shows buddy');
+// ---- forgot / reset password ----
+ok((await X('POST', '/auth/forgot', { email: 'nobody@x.co.za' })).s === 200 && outbox.length === 0, 'forgot password: unknown email gets same answer, no email sent');
+ok((await X('POST', '/auth/forgot', { email: 'p@x.co.za' })).s === 200 && outbox.length === 1, 'forgot password: email sent to parent'); const tok = outbox[0].text.match(/reset\/([a-f0-9]{64})/)[1];
+ok((await X('POST', '/auth/reset', { token: tok, password: 'short' })).s === 400, 'reset rejects short password');
+ok((await X('POST', '/auth/reset', { token: 'bad'.repeat(20), password: 'brandnewpass' })).s === 400, 'reset rejects invalid token');
+ok((await X('POST', '/auth/reset', { token: tok, password: 'brandnewpass' })).s === 200, 'reset with valid token works');
+ok((await X('POST', '/auth/reset', { token: tok, password: 'anotherpass1' })).s === 400, 'reset link is single-use');
+ok((await P('GET', '/me')).s === 401, 'old sessions are signed out after reset');
+ok((await mk()('POST', '/auth/login', { email: 'p@x.co.za', password: 'password1' })).s === 401 && (await mk()('POST', '/auth/login', { email: 'p@x.co.za', password: 'brandnewpass' })).s === 200, 'new password works, old one does not');
+await X('POST', '/auth/forgot', { email: 't@x.co.za' }); ok(outbox.length === 2 && outbox[1].to === 't@x.co.za', 'forgot password works for learners too');
+ok((await L('GET', '/admin/stats')).s === 403, 'learner blocked from admin');
+ok((await mk()('POST', '/contact', { name: 'Visitor', email: 'v@x.co.za', message: 'Hello, can schools partner?' })).s === 201, 'contact form saves');
+await A('POST', '/auth/login', { email: 'admin@test.co.za', password: 'adminpass123' });
+r = await A('GET', '/admin/stats'); ok(r.d.learners === 1 && r.d.parents === 1 && r.d.newEnquiries === 1 && r.d.lessons > 70, 'admin stats correct');
+const eq = (await A('GET', '/admin/enquiries')).d[0].id; ok((await A('PATCH', '/admin/enquiries/' + eq, { status: 'resolved', note: 'Replied' })).s === 200, 'admin resolves enquiry');
+ok((await A('POST', '/admin/lessons', { subject_id: hl.id, grade: 4, title: 'No keywords', steps: ['plain'], kind: 'static' })).s === 400, 'admin lesson needs key words');
+r = await A('POST', '/admin/lessons', { subject_id: hl.id, grade: 4, title: 'Extra', module: 'New Module', steps: ['A *verb* acts'], mnemonic: 'V for velocity', kind: 'static' }); ok(r.s === 200, 'admin creates lesson in a new module');
+ok((await A('DELETE', '/admin/lessons/' + r.d.id)).s === 200, 'admin deletes lesson');
+const uid = (await A('GET', '/admin/users?q=Thabo')).d[0].id; await A('PATCH', '/admin/users/' + uid, { active: false }); ok((await L('GET', '/me')).s === 401, 'deactivated user loses access');
+srv.close(); console.log(fail ? `\n${fail} FAILED` : '\nAll tests passed'); process.exit(fail ? 1 : 0);
